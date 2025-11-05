@@ -1,4 +1,3 @@
-# Drop-in replacement for the GBDT trainer (uses scikit-learn)
 import numpy as np, pandas as pd
 from pathlib import Path
 from sklearn.model_selection import train_test_split
@@ -25,7 +24,7 @@ wmap = {c:wi for c,wi in zip(classes, w)}
 sw = np.array([wmap[yi] for yi in ytr])
 
 gb = HistGradientBoostingClassifier(
-    loss="log_loss",        # multiclass
+    loss="log_loss",       
     max_depth=6,
     learning_rate=0.05,
     max_leaf_nodes=31,

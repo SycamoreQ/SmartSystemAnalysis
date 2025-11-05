@@ -15,7 +15,7 @@ from sklearn.preprocessing import StandardScaler
 
 
 FD = "FD001"                
-DATA_DIR = Path("./archive")    #
+DATA_DIR = Path("./archive")    
 OUT_DIR = Path("./processed")
 
 ROLL_WIN = 20                # Rolling window size (cycles)
@@ -151,17 +151,14 @@ def preprocess_fd(fd: str = FD,
                   rul_cap: int = RUL_CAP) -> Dict[str, pd.DataFrame]:
     train, test, rul = load_fd(fd, data_dir)
 
-    # Remove low-value columns early
     train = drop_low_value_columns(train, drop_cols)
     test  = drop_low_value_columns(test,  drop_cols)
 
-    # Labels
     train = add_rul_train(train, cap=rul_cap)
     test  = add_rul_test(test, rul_df=rul, cap=rul_cap)
     train = discretize_states_from_rul(train)
     test  = discretize_states_from_rul(test)
 
-    # Strict sensor detection: s1..s21 only (avoid 'state')
     sensor_cols = [c for c in train.columns if re.fullmatch(r"s\d+", c)]
     op_cols     = [c for c in ["op1", "op2"] if c in train.columns]
     id_cols     = ["unit", "cycle"]
