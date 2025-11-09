@@ -1,0 +1,116 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+FD = "FD001"
+ROOT = Path(".").resolve()
+DATA_DIR = ROOT / "archive"
+PROC_DIR = ROOT / "processed"
+PROC_DIR.mkdir(parents=True, exist_ok=True)
+
+op_settings = ['op_setting_1', 'op_setting_2', 'op_setting_3']
+sensors = [f's_{i}' for i in range(1, 22)]
+cols = ['unit', 'cycle'] + op_settings + sensors
+
+base_features = [
+    's_2', 's_3', 's_4', 's_7', 's_8', 's_9', 's_11', 
+    's_12', 's_13', 's_14', 's_15', 's_17', 's_20', 's_21'
+]
+features_cols = op_settings + base_features
+
+bins = [-np.inf, 30, 70, 120, 180, np.inf]
+bin_labels = [4, 3, 2, 1, 0] # 0=Healthy, 4=Failure
+
+def load_and_process_train():
+    print(f"Processing {FD}_train.txt...")
+    df = pd.read_csv(DATA_DIR / f"train_{FD}.txt", sep=' ', header=None, names=cols, index_col=False)
+    df = df.dropna(axis=1, how='all')
+
+    max_cycles = df.groupby('unit')['cycle'].max().to_dict()
+    df['RUL'] = df['unit'].map(max_cycles) - df['cycle']
+    print(f"Original features: {len(features_cols)}")
+    new_features = []
+    window_sizes = [5, 10] 
+    
+    grouped = df.groupby('unit')
+    
+    for window in window_sizes:
+        rolling_mean = grouped[base_features].rolling(window=window, min_periods=1).mean()
+        rolling_std = grouped[base_features].rolling(window=window, min_periods=1).std()
+        
+        mean_cols = [f"{col}_mean_{window}" for col in base_features]
+        std_cols = [f"{col}_std_{window}" for col in base_features]
+        
+        df[mean_cols] = rolling_mean.reset_index(level=0, drop=True)
+        df[std_cols] = rolling_std.reset_index(level=0, drop=True)
+        
+        new_features.extend(mean_cols)
+        new_features.extend(std_cols)
+
+    df.fillna(method='bfill', inplace=True) 
+    df.fillna(method='ffill', inplace=True)
+    df.fillna(0, inplace=True) 
+
+    final_feature_list = features_cols + new_features
+    print(f"Total features after engineering: {len(final_feature_list)}")
+    
+    # Create discrete health states
+    df['state'] = pd.cut(df['RUL'], bins=bins, labels=bin_labels, right=True).astype(int)
+    
+    print(f"Train data shape: {df.shape}")
+    print("State distribution (Train):\n", df['state'].value_counts().sort_index())
+    
+    out_path = PROC_DIR / f"{FD}_train_preprocessed.parquet"
+    df.to_parquet(out_path, index=False)
+    print(f"Saved to {out_path}")
+    return final_feature_list
+
+def load_and_process_test(final_feature_list):
+    print(f"Processing {FD}_test.txt and RUL_{FD}.txt...")
+    df = pd.read_csv(DATA_DIR / f"test_{FD}.txt", sep=' ', header=None, names=cols, index_col=False)
+    df = df.dropna(axis=1, how='all')
+    
+    true_rul = pd.read_csv(DATA_DIR / f"RUL_{FD}.txt", sep=' ', header=None, names=['RUL'], index_col=False)
+    true_rul = true_rul.dropna(axis=1, how='all')
+    true_rul['unit'] = true_rul.index + 1
+    
+    max_cycles = df.groupby('unit')['cycle'].max().to_dict()
+    df = df.merge(true_rul, on='unit', how='left')
+    df['RUL'] = (df['unit'].map(max_cycles) - df['cycle']) + df['RUL']
+
+    print(f"Applying feature engineering to test set...")
+    window_sizes = [5, 10]
+    grouped = df.groupby('unit')
+    
+    for window in window_sizes:
+        rolling_mean = grouped[base_features].rolling(window=window, min_periods=1).mean()
+        rolling_std = grouped[base_features].rolling(window=window, min_periods=1).std()
+        
+        mean_cols = [f"{col}_mean_{window}" for col in base_features]
+        std_cols = [f"{col}_std_{window}" for col in base_features]
+        
+        df[mean_cols] = rolling_mean.reset_index(level=0, drop=True)
+        df[std_cols] = rolling_std.reset_index(level=0, drop=True)
+
+    df.fillna(method='bfill', inplace=True)
+    df.fillna(method='ffill', inplace=True)
+    df.fillna(0, inplace=True)
+
+    # Create discrete health states
+    df['state'] = pd.cut(df['RUL'], bins=bins, labels=bin_labels, right=True).astype(int)
+
+    print(f"Test data shape: {df.shape}")
+    print("State distribution (Test):\n", df['state'].value_counts().sort_index())
+
+    out_path = PROC_DIR / f"{FD}_test_preprocessed.parquet"
+    df.to_parquet(out_path, index=False)
+    print(f"Saved to {out_path}")
+
+
+if __name__ == "__main__":
+    final_features = load_and_process_train()
+    load_and_process_test(final_features)
+
+    pd.Series(final_features).to_csv(PROC_DIR / f"{FD}_feature_list.txt", index=False, header=False)
+    pd.Series(sorted(bin_labels)).to_csv(PROC_DIR / f"{FD}_class_labels.txt", index=False, header=False)
+    print("Preprocessing v2 complete.")
