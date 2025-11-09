@@ -6,4 +6,5 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "reliability>=0.9.0",
+    "seaborn>=0.13.2",
 ]
