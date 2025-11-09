@@ -11,7 +11,7 @@ This project implements the GBDT-DBN reliability assessment framework from Zhang
 
 2.  **Environment:**
     ```bash
-    # Create a virtual environment (optional but recommended)
+    # Create a virtual environment
     use uv since I used uv so:
     uv init 
     uv venv
