@@ -18,32 +18,25 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 def read_any(pq: Path, csv: Path):
     return pd.read_parquet(pq) if pq.exists() else pd.read_csv(csv)
 
-# --- Load Artifacts ---
-print("[infer] Loading all artifacts...")
 
-# 1. Data & Features
+print("[infer] Loading all artifacts...")
 test = read_any(PROC_DIR / f"{FD}_test_preprocessed.parquet",
                 PROC_DIR / f"{FD}_test_preprocessed.csv")
 feature_cols = pd.read_csv(MODELS_DIR / f"{FD}_features.txt", header=None).iloc[:,0].tolist()
 
-# 2. Labels (Keep as integers 0, 1, 2, 3, 4 for indexing)
 labels = pd.read_csv(MODELS_DIR / f"{FD}_class_labels.txt", header=None).iloc[:,0].tolist()
 K = len(labels)
 
-# CRITICAL FIX: Define the required string state names for soft evidence factors
 STRING_STATE_NAMES = [str(l) for l in labels] # ['0', '1', '2', '3', '4']
 print(f"[infer] K={K} states: {labels}")
 
-# 3. Monitor
 calibrated_path = MODELS_DIR / f"{FD}_monitor_calibrated.joblib"
 monitor = load(calibrated_path)
 print(f"[infer] Loaded calibrated monitor: {calibrated_path.name}")
 
-# 4. CPTs
 P_y_given_c = pd.read_csv(MODELS_DIR / f"{FD}_P_y_given_c.csv", header=None).values
 P_trans = pd.read_csv(MODELS_DIR / f"{FD}_P_C_next_given_C_weibull.csv", header=None).values
 
-# --- CPD Validation & Normalization ---
 def fix_and_normalize_cpd(M: np.ndarray, name: str, shape: tuple):
     if M.shape != shape:
         raise ValueError(f"{name} shape is {M.shape}, expected {shape}")
@@ -62,7 +55,6 @@ def fix_and_normalize_cpd(M: np.ndarray, name: str, shape: tuple):
 P_y_given_c = fix_and_normalize_cpd(P_y_given_c, "P_y_given_c", (K, K))
 P_trans     = fix_and_normalize_cpd(P_trans,     "P_trans",     (K, K))
 
-# --- Build DBN Model ---
 print("[infer] Building DBN...")
 model = DBN()
 # C: Hidden State, Y: Observed State
@@ -71,10 +63,8 @@ model.add_edges_from([
     (('C', 0), ('C', 1)),  # Transition: C_t -> C_t+1
 ])
 
-# Define Prior: P(C_0). Start in the healthiest state (State 0)
 prior = np.zeros(K); prior[0] = 1.0
 
-# Define CPDs: Use default integer state names for stability
 cpd_C0 = TabularCPD(('C', 0), K, prior.reshape(-1, 1))
 cpd_C1 = TabularCPD(('C', 1), K, P_trans, 
                     evidence=[('C', 0)], evidence_card=[K])
@@ -86,7 +76,6 @@ model.initialize_initial_state()
 model.check_model()
 print("[infer] DBN model constructed and checked.")
 
-# --- Inference Function ---
 def run_inference_on_unit(g: pd.DataFrame):
     X_u = g[feature_cols].values
     proba_y = monitor.predict_proba(X_u)
@@ -99,13 +88,10 @@ def run_inference_on_unit(g: pd.DataFrame):
         reliab.append(1.0 - post_c[-1])  # last index = fail
     return np.array(reliab), y_hard
 
-
-# --- Run Inference on All Test Units ---
 print("[infer] Running inference on all test units...")
 outs = []
 for u, g in test.groupby("unit", sort=True):
     g = g.sort_values("cycle")
-    # r = reliability sequence, y_seq = GBDT observed state sequence
     r, y_seq = run_inference_on_unit(g)
     
     unit_df = pd.DataFrame({

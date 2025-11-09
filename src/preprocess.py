@@ -20,7 +20,7 @@ features = [
 features_cols = op_settings + features
 print(f"Using {len(features_cols)} features.")
 
-bins = [-np.inf, 20, 60, 120, 200, np.inf]
+bins = [-np.inf, 30, 70, 120, 180, np.inf]
 labels = [4, 3, 2, 1, 0]
 
 def load_and_process_train():

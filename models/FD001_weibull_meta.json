@@ -4,5 +4,5 @@
   "K":5.0,
   "dt":1.0,
   "age_step":35.0,
-  "stay_frac":0.9
+  "stay_frac":0.95
 }
