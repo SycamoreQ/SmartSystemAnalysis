@@ -15,98 +15,139 @@ MODELS_DIR = ROOT / "models"
 OUT_DIR = ROOT / "outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Define prediction horizon (e.g., max life in the dataset)
+MAX_PRED_CYCLES = 250 
+
 def read_any(pq: Path, csv: Path):
     return pd.read_parquet(pq) if pq.exists() else pd.read_csv(csv)
-
 
 print("[infer] Loading all artifacts...")
 test = read_any(PROC_DIR / f"{FD}_test_preprocessed.parquet",
                 PROC_DIR / f"{FD}_test_preprocessed.csv")
-feature_cols = pd.read_csv(MODELS_DIR / f"{FD}_features.txt", header=None).iloc[:,0].tolist()
+# Use the new feature list name from the trainer
+feature_cols = pd.read_csv(MODELS_DIR / f"{FD}_features.txt", header=None).iloc[:,0].tolist() 
 
 labels = pd.read_csv(MODELS_DIR / f"{FD}_class_labels.txt", header=None).iloc[:,0].tolist()
 K = len(labels)
 
-STRING_STATE_NAMES = [str(l) for l in labels] # ['0', '1', '2', '3', '4']
+STRING_STATE_NAMES = [str(l) for l in labels] 
 print(f"[infer] K={K} states: {labels}")
 
+# Load GBDT monitor
 calibrated_path = MODELS_DIR / f"{FD}_monitor_calibrated.joblib"
 monitor = load(calibrated_path)
-print(f"[infer] Loaded calibrated monitor: {calibrated_path.name}")
+print(f"[infer] Monitor loaded: {calibrated_path.name}")
 
+# Load CPTs
 P_y_given_c = pd.read_csv(MODELS_DIR / f"{FD}_P_y_given_c.csv", header=None).values
-P_trans = pd.read_csv(MODELS_DIR / f"{FD}_P_C_next_given_C_weibull.csv", header=None).values
+P_trans     = pd.read_csv(MODELS_DIR / f"{FD}_P_C_next_given_C_weibull.csv", header=None).values
 
-def fix_and_normalize_cpd(M: np.ndarray, name: str, shape: tuple):
-    if M.shape != shape:
-        raise ValueError(f"{name} shape is {M.shape}, expected {shape}")
-    
-    M = np.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
-    M = np.clip(M, 1e-9, 1.0) 
-    
-    col_sums = M.sum(axis=0, keepdims=True)
-    col_sums[col_sums == 0] = 1.0
-    M = M / col_sums
-    
-    dev = float(np.max(np.abs(M.sum(axis=0) - 1.0)))
-    print(f"[infer] {name}: shape={M.shape}, max_col_deviation={dev:.2e}")
-    return M
+# DBN Construction
+model = DBN([(('C', 0), ('C', 1)), (('C', 0), ('Y', 0))])
+prior = np.array([1.0] + [0.0]*(K-1)) # Initial state: 100% in State 0
 
-P_y_given_c = fix_and_normalize_cpd(P_y_given_c, "P_y_given_c", (K, K))
-P_trans     = fix_and_normalize_cpd(P_trans,     "P_trans",     (K, K))
+assert P_y_given_c.shape == (K, K), f"P(Y|C) must be {K}x{K}, got {P_y_given_c.shape}"
+assert P_trans.shape     == (K, K), f"P(C'|C) must be {K}x{K}, got {P_trans.shape}"
 
-print("[infer] Building DBN...")
-model = DBN()
-# C: Hidden State, Y: Observed State
-model.add_edges_from([
-    (('C', 0), ('Y', 0)),  # Emission: C_t -> Y_t
-    (('C', 0), ('C', 1)),  # Transition: C_t -> C_t+1
-])
-
-prior = np.zeros(K); prior[0] = 1.0
-
-cpd_C0 = TabularCPD(('C', 0), K, prior.reshape(-1, 1))
-cpd_C1 = TabularCPD(('C', 1), K, P_trans, 
-                    evidence=[('C', 0)], evidence_card=[K])
-cpd_Y0 = TabularCPD(('Y', 0), K, P_y_given_c, 
-                    evidence=[('C', 0)], evidence_card=[K])
+cpd_C0 = TabularCPD(('C', 0), K, prior.reshape(-1,1))
+cpd_C1 = TabularCPD(('C', 1), K, P_trans, evidence=[('C', 0)], evidence_card=[K])
+cpd_Y0 = TabularCPD(('Y', 0), K, P_y_given_c, evidence=[('C', 0)], evidence_card=[K])
 
 model.add_cpds(cpd_C0, cpd_C1, cpd_Y0)
 model.initialize_initial_state()
 model.check_model()
 print("[infer] DBN model constructed and checked.")
 
-def run_inference_on_unit(g: pd.DataFrame):
+
+def run_inference_and_prediction_on_unit(g: pd.DataFrame):
+    """
+    Runs DBN inference in two phases: Filtering (data available) and Prediction (extrapolation).
+    """
+    unit_id = g['unit'].iloc[0]
     X_u = g[feature_cols].values
-    proba_y = monitor.predict_proba(X_u)
-    y_hard = np.argmax(proba_y, axis=1).astype(int)
+    T_max = len(g)
+    
+    # GBDT soft evidence P(Y|X) and hard evidence (Y_obs)
+    proba_obs = monitor.predict_proba(X_u)
+    y_hard = np.argmax(proba_obs, axis=1) # The hard evidence to pass to DBN
+    
+    # --- PHASE 1: FILTERING (t <= T_max) ---
+    posteriors = [] # To store P(C_t | Y_1:t)
+    inf = DBNInference(model) 
+    current_post = np.array(prior)
 
-    reliab = []
-    inf = DBNInference(model)
-    for t, y in enumerate(y_hard):
-        post_c = inf.forward_inference([('C', t)], evidence={(('Y', t)): int(y)})[('C', t)].values
-        reliab.append(1.0 - post_c[-1])  # last index = fail
-    return np.array(reliab), y_hard
+    # Filtering loop using hard evidence
+    for t in range(T_max):
+        # The 'evidence' value must be cast to a standard Python int
+        post = inf.forward_inference([('C', t)], evidence={(('Y', t)): int(y_hard[t])})[('C', t)].values
+        current_post = post.flatten()
+        posteriors.append(current_post)
+        
+    last_post = current_post if posteriors else prior
+    
+    # --- PHASE 2: PREDICTION (t > T_max) ---
+    # We extrapolate the blue line using only the Transition CPT (P_trans).
+    
+    predicted_posteriors = []
+    current_pred_post = last_post
+    
+    # Prediction loop
+    for t in range(T_max, MAX_PRED_CYCLES):
+        # P(C_next) = P(C_next | C_current) * P(C_current)
+        P_next = P_trans @ current_pred_post  
+        
+        predicted_posteriors.append(P_next)
+        current_pred_post = P_next
+        
+        # Optional: Stop prediction early if reliability is already near zero
+        if (1.0 - P_next[K-1]) < 0.001:
+            break
+            
+    # Combine results
+    all_posteriors = np.array(posteriors + predicted_posteriors)
+    total_cycles = len(all_posteriors)
+    
+    # DBN Reliability (Blue Line)
+    reliability = 1.0 - all_posteriors[:, K-1]
+    
+    # --- Prepare Output DataFrame ---
+    
+    # FIX: Convert integer arrays to float before padding with np.nan to avoid ValueError.
+    
+    # 1. GBDT State (integer)
+    gbdt_state_padded = np.pad(y_hard.astype(float), (0, total_cycles - T_max), constant_values=np.nan)
+    
+    # 2. True RUL (integer from the RUL column)
+    rul_true_padded = np.pad(g['RUL'].values.astype(float), (0, total_cycles - T_max), constant_values=np.nan)
+    
+    # 3. True State (integer)
+    state_true_padded = np.pad(g['state'].values.astype(float), (0, total_cycles - T_max), constant_values=np.nan)
 
-print("[infer] Running inference on all test units...")
-outs = []
+
+    results = pd.DataFrame({
+        'unit': unit_id,
+        'cycle': np.arange(1, total_cycles + 1),
+        'DBN_reliability': reliability,
+        'DBN_state': np.argmax(all_posteriors, axis=1),
+        # Padded float arrays
+        'GBDT_state': gbdt_state_padded, 
+        'RUL_true': rul_true_padded, 
+        'state_true': state_true_padded, 
+        'is_prediction': [False]*T_max + [True]*(total_cycles - T_max)
+    })
+    
+    return results
+
+print("[infer] Running inference and prediction on all test units...")
+all_results = []
 for u, g in test.groupby("unit", sort=True):
     g = g.sort_values("cycle")
-    r, y_seq = run_inference_on_unit(g)
+    results = run_inference_and_prediction_on_unit(g)
+    all_results.append(results)
     
-    unit_df = pd.DataFrame({
-        "unit": u,
-        "cycle": g["cycle"].values,
-        "reliability": r,
-        "y_obs": y_seq,
-        "RUL_true": g["RUL"].values,
-        "state_true": g["state"].values
-    })
-    outs.append(unit_df)
-    if u % 10 == 0:
-        print(f"  ... completed unit {u}")
+df_out = pd.concat(all_results, ignore_index=True)
 
-res = pd.concat(outs, ignore_index=True)
+# Save results
 out_path = OUT_DIR / f"{FD}_dbn_reliability.csv"
-res.to_csv(out_path, index=False)
-print(f"\n[infer] Success! Saved results to: {out_path}")
+df_out.to_csv(out_path, index=False)
+print(f"[infer] Results saved to {out_path.name}")
