@@ -47,7 +47,7 @@ beta = scale    # scale parameter (usually 'eta' or 'lambda')
 print(f"[weibull_trans] Fitted Weibull: alpha={alpha:.4f} (shape), beta={beta:.4f} (scale)")
 
 
-# 3) Build a KxK column-stochastic transition matrix P(C_{t+1}|C_t)
+#Build a KxK column-stochastic transition matrix P(C_{t+1}|C_t)
 def weibull_transition_matrix(n_states, dt, alpha, beta, age_step, stay_frac):
     P = np.zeros((n_states, n_states))
     

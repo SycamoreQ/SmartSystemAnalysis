@@ -7,7 +7,7 @@ from pgmpy.models import DynamicBayesianNetwork as DBN
 from pgmpy.factors.discrete import TabularCPD, DiscreteFactor
 from pgmpy.inference import DBNInference
 
-# --- Configuration ---
+# Configuration 
 FD = os.environ.get("FD", "FD001")
 ROOT = Path(".").resolve()
 PROC_DIR = ROOT / "processed"
@@ -15,7 +15,7 @@ MODELS_DIR = ROOT / "models"
 OUT_DIR = ROOT / "outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Define prediction horizon (e.g., max life in the dataset)
+# Define prediction horizon 
 MAX_PRED_CYCLES = 250 
 
 def read_any(pq: Path, csv: Path):
@@ -24,7 +24,6 @@ def read_any(pq: Path, csv: Path):
 print("[infer] Loading all artifacts...")
 test = read_any(PROC_DIR / f"{FD}_test_preprocessed.parquet",
                 PROC_DIR / f"{FD}_test_preprocessed.csv")
-# Use the new feature list name from the trainer
 feature_cols = pd.read_csv(MODELS_DIR / f"{FD}_features.txt", header=None).iloc[:,0].tolist() 
 
 labels = pd.read_csv(MODELS_DIR / f"{FD}_class_labels.txt", header=None).iloc[:,0].tolist()
@@ -69,29 +68,27 @@ def run_inference_and_prediction_on_unit(g: pd.DataFrame):
     
     # GBDT soft evidence P(Y|X) and hard evidence (Y_obs)
     proba_obs = monitor.predict_proba(X_u)
-    y_hard = np.argmax(proba_obs, axis=1) # The hard evidence to pass to DBN
+    y_hard = np.argmax(proba_obs, axis=1)
     
-    # --- PHASE 1: FILTERING (t <= T_max) ---
+    #Phase 1 : FILTERING (t <= T_max)
     posteriors = [] # To store P(C_t | Y_1:t)
     inf = DBNInference(model) 
     current_post = np.array(prior)
 
     # Filtering loop using hard evidence
     for t in range(T_max):
-        # The 'evidence' value must be cast to a standard Python int
         post = inf.forward_inference([('C', t)], evidence={(('Y', t)): int(y_hard[t])})[('C', t)].values
         current_post = post.flatten()
         posteriors.append(current_post)
         
     last_post = current_post if posteriors else prior
     
-    # --- PHASE 2: PREDICTION (t > T_max) ---
+    #Phase 2: PREDICTION (t > T_max) ---
     # We extrapolate the blue line using only the Transition CPT (P_trans).
     
     predicted_posteriors = []
     current_pred_post = last_post
-    
-    # Prediction loop
+
     for t in range(T_max, MAX_PRED_CYCLES):
         # P(C_next) = P(C_next | C_current) * P(C_current)
         P_next = P_trans @ current_pred_post  
@@ -99,11 +96,9 @@ def run_inference_and_prediction_on_unit(g: pd.DataFrame):
         predicted_posteriors.append(P_next)
         current_pred_post = P_next
         
-        # Optional: Stop prediction early if reliability is already near zero
         if (1.0 - P_next[K-1]) < 0.001:
             break
             
-    # Combine results
     all_posteriors = np.array(posteriors + predicted_posteriors)
     total_cycles = len(all_posteriors)
     
@@ -112,15 +107,10 @@ def run_inference_and_prediction_on_unit(g: pd.DataFrame):
     
     # --- Prepare Output DataFrame ---
     
-    # FIX: Convert integer arrays to float before padding with np.nan to avoid ValueError.
-    
-    # 1. GBDT State (integer)
     gbdt_state_padded = np.pad(y_hard.astype(float), (0, total_cycles - T_max), constant_values=np.nan)
     
-    # 2. True RUL (integer from the RUL column)
     rul_true_padded = np.pad(g['RUL'].values.astype(float), (0, total_cycles - T_max), constant_values=np.nan)
     
-    # 3. True State (integer)
     state_true_padded = np.pad(g['state'].values.astype(float), (0, total_cycles - T_max), constant_values=np.nan)
 
 
@@ -129,7 +119,6 @@ def run_inference_and_prediction_on_unit(g: pd.DataFrame):
         'cycle': np.arange(1, total_cycles + 1),
         'DBN_reliability': reliability,
         'DBN_state': np.argmax(all_posteriors, axis=1),
-        # Padded float arrays
         'GBDT_state': gbdt_state_padded, 
         'RUL_true': rul_true_padded, 
         'state_true': state_true_padded, 
@@ -147,7 +136,6 @@ for u, g in test.groupby("unit", sort=True):
     
 df_out = pd.concat(all_results, ignore_index=True)
 
-# Save results
 out_path = OUT_DIR / f"{FD}_dbn_reliability.csv"
 df_out.to_csv(out_path, index=False)
 print(f"[infer] Results saved to {out_path.name}")
